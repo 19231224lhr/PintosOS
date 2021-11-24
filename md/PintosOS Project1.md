@@ -618,7 +618,7 @@ timer_sleep(int64_t ticks) {
     ASSERT(intr_get_level() == INTR_ON);
     // 禁用中断，并保存上一个中断状态，使得接下来的操作为原子操作
     enum intr_level old_level = intr_disable();
-    // 获取当前线程起始指位置
+    // 获取当前线程起始指针位置
     struct thread *current_thread = thread_current();
     // 设置线程休眠时间
     current_thread->ticks_blocked = ticks;
@@ -775,4 +775,402 @@ t->ticks_blocked = 0;
 具体修改文件内容可以在我们的`github`仓库地址中查看，仓库地址：https://github.com/19231224lhr/Pintos
 
 ![image-20211028102553860](image-20211028102553860.png)
+
+
+
+## 任务二 优先级调度
+
+### 任务1	实现优先级调度
+
+在原始的代码实现中，线程的就绪队列基本采用的是**先来先服务**的调度⽅式，即先进⼊就绪队列的线程在调度时会先获得CPU，这个实验的目的是**将这种调度策略改成`优先级调度`**。
+
+即当⼀个线程被添加到就绪列表中，并且该线程的优先级高于当前正在运行的线程时，当前线程应该立即将处理器交付给新线程。类似地，当有多个线程正在等待锁、信号量或条件变量时，优先级最高的等待线程应该首先被唤醒。
+
+在Pintos中，**线程优先级范围为`0到63`**。 **较低的数字对应较低的优先级**，因此优先级 0 是最低优先级，优先级 63 是最⾼优先级。**线程创建时默认的优先级为`PRI_DEFAULT = 31`**。
+
+> 在实现优先级调度的时候，不仅仅需要考虑线程的就绪队列，**还要考虑信号量和条件变量的等待队列**。
+
+
+
+### 任务2	实现优先级捐赠
+
+在本实验中，**优先级捐赠主要是针对线程对于锁的获取的**。例如：如果`线程H`拥有较高的优先级，`线程M`拥有中等 的优先级，`线程L`拥有较低的优先级。此时若`线程H`正在等待`线程L`持有的**锁**, 且`M`⼀直在就绪队列之中，那么`线程H`将永远无法获得CPU。因此，**这个时候需要将`H`的优先级捐赠给`L`**。
+
+优先级调度的一个问题是“优先级反转”。分别考虑高、中、低优先级线程H、M和L。如果H需要等待L（例如，对于L持有的锁），并且M在就绪列表中，那么H将永远不会获得CPU，因为低优先级线程不会获得任何CPU时间。这个问题的一个部分修复方法是H在L持有锁时将其优先级“捐赠”给L，然后在L释放锁（从而H获得锁）后**召回捐赠**。
+
+<img src="image-20211028161754769.png" alt="image-20211028161754769" style="zoom:50%;" />
+
+> - ⼀个锁只能被单个线程持有，而⼀个线程却可以持有多个锁。当线程持有多个锁时，需要**将线程的优先级设置为其被捐赠的优先级中最大的**；
+> - 会出现**递归捐赠**的问题。例如当前存在⼀个⾼优先级线程H，⼀个中优先级线程M，⼀个低优先级线程L。如 果H正在申请M持有的锁，M正在申请L持有的锁，那么M和L的优先级都需要被设置为H的优先级。
+
+必须为锁实现优先级捐赠。**您不需要为其他Pintos同步构造实现优先级捐赠**。您确实需要在所有情况下实施优先级调度。
+
+最后，实现以下函数，允许线程检查和修改自己的优先级。`threads/thread.c`中提供了这些函数的框架。
+
+**`thread_set_priorit()`**函数：将当前线程的优先级设置为新线程优先级。如果当前线程不再具有最高优先级，则生成。
+
+**`thread_get_priority()`**函数：返回当前线程的优先级。如果存在优先捐赠，则返回较高的（捐赠）优先权。
+
+> 您不需要提供任何接口来允许线程直接修改其他线程的优先级。
+>
+> **优先级计划程序不会在以后的任何项目中使用**。
+
+题目内容参考网址：http://web.stanford.edu/~ouster/cgi-bin/cs140-spring20/pintos/pintos_2.html
+
+### 代码分析
+
+在任务一中已经大致了解了Pintos的线程调度策略，我们这里再次分析Pintos的线程结构：
+
+```c
+struct thread
+{
+    /* Owned by thread.c. */
+    tid_t tid;                          /* Thread identifier. */
+    enum thread_status status;          /* Thread state. */
+    char name[16];                      /* Name (for debugging purposes). */
+    uint8_t *stack;                     /* Saved stack pointer. */
+    int priority;                       /* Priority. */
+	// ......
+};
+```
+
+在线程的定义中已经有了优先级的定义，同时在`thread.h`文件中也定义了其几个状态：
+
+```c
+/* Thread priorities. */
+#define PRI_MIN 0                       /* Lowest priority. */
+#define PRI_DEFAULT 31                  /* Default priority. */
+#define PRI_MAX 63                      /* Highest priority. */
+```
+
+我们任务2.1的主要任务就是将就绪队列始终维护为一个优先级调度策略队列即可。
+
+所以，**那些函数或者操作会造成进程就绪队列的改变呢**？
+
+- `thread_unblock()`函数
+
+```c
+void
+thread_unblock (struct thread *t)
+{
+  enum intr_level old_level;
+
+  ASSERT (is_thread (t));
+
+  old_level = intr_disable ();
+  ASSERT (t->status == THREAD_BLOCKED);
+  // list_push_back()h
+  list_push_back (&ready_list, &t->elem);
+  t->status = THREAD_READY;
+  intr_set_level (old_level);
+}
+```
+
+其中的`list_push_back (&ready_list, &t->elem);`我们具体去看，会发现他是将一个线程直接放在就绪队列的末尾，这显然不符合我们线程优先级调度的策略，因此我们需要将其修改。
+
+有关线程的定义和相关函数在文件`/lib/kernel/list.c`中。
+
+```c
+/* Inserts ELEM in the proper position in LIST, which must be
+   sorted according to LESS given auxiliary data AUX.
+   Runs in O(n) average case in the number of elements in LIST. */
+
+void
+list_insert_ordered (struct list *list, struct list_elem *elem,
+                     list_less_func *less, void *aux)
+{
+  struct list_elem *e;
+
+  ASSERT (list != NULL);
+  ASSERT (elem != NULL);
+  ASSERT (less != NULL);
+
+  for (e = list_begin (list); e != list_end (list); e = list_next (e))
+    if (less (elem, e, aux))
+      break;
+  return list_insert (e, elem);
+}
+```
+
+> **函数功能**：在列表中的正确位置插入元素，必须根据较少给定的辅助数据进行排序。
+
+这其中定义了一个bool类型的结构体：
+
+```c
+/* Compares the value of two list elements A and B, given
+   auxiliary data AUX.  Returns true if A is less than B, or
+   false if A is greater than or equal to B. */
+
+typedef bool list_less_func (const struct list_elem *a,
+                             const struct list_elem *b,
+                             void *aux);
+```
+
+> **结构体功能**：比较给定的两个列表元素A和B的值。如果A小于B，则返回true，或如果A大于或等于B，则为false。
+
+因此，我们需要将线程唤醒时自动添加到就绪队列末尾的方法修改为按照优先级插入到就绪队列中。插入的位置如何确定呢？这时候就需要在函数`list_insert_ordered`中参数less的定义了。
+
+首先，实现比较线程优先级的函数：
+
+```c
+/* priority compare function. */
+bool
+thread_cmp_priority (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  return list_entry(a, struct thread, elem)->priority > list_entry(b, struct thread, elem)-priority;
+}
+```
+
+将bool值强制类型转换为`list_less_func`类型然后作为参数传入在指定位置插入线程的函数。
+
+将下面的语句替换`unlock`函数中的`push_back`语句即可：
+
+```c
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp_priority, NULL);
+```
+
+同理，我们为其他两个也修改了线程就绪队列的函数也做出如下修改即可。
+
+`init_thread`：
+
+```c
+list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp_priority, NULL);
+```
+
+`thread_yield`：
+
+```c
+list_insert_ordered (&ready_list, &cur->elem, (list_less_func *) &thread_cmp_priority, NULL);
+```
+
+**这三步修改完后，任务一中有关于优先级的测试点就可以正常通过。**
+
+接下来，我们来看看其他测试点的测试数据：
+
+> **`priority_preempt`**，**`priority-change`**
+
+测试文件在`tests`文件夹下的对应文件名文件中。
+
+```c
+void
+test_priority_preempt (void) 
+{
+  /* This test does not work with the MLFQS. */
+  ASSERT (!thread_mlfqs);
+
+  /* Make sure our priority is the default. */
+  ASSERT (thread_get_priority () == PRI_DEFAULT);
+
+  // 这里调用了下面创建的函数simple_thread_func()函数作为函数参数
+  thread_create ("high-priority", PRI_DEFAULT + 1, simple_thread_func, NULL);
+  msg ("The high-priority thread should have already completed.");
+}
+
+static void 
+simple_thread_func (void *aux UNUSED) 
+{
+  int i;
+  
+  for (i = 0; i < 5; i++) 
+    {
+      msg ("Thread %s iteration %d", thread_name (), i);
+      thread_yield ();
+    }
+  msg ("Thread %s done!", thread_name ());
+}
+```
+
+```c
+void
+test_priority_change (void) 
+{
+  /* This test does not work with the MLFQS. */
+  ASSERT (!thread_mlfqs);
+
+  msg ("Creating a high-priority thread 2.");
+  thread_create ("thread 2", PRI_DEFAULT + 1, changing_thread, NULL);
+  msg ("Thread 2 should have just lowered its priority.");
+  thread_set_priority (PRI_DEFAULT - 2);
+  msg ("Thread 2 should have just exited.");
+}
+
+static void
+changing_thread (void *aux UNUSED) 
+{
+  msg ("Thread 2 now lowering priority.");
+  thread_set_priority (PRI_DEFAULT - 1);
+  msg ("Thread 2 exiting.");
+}
+```
+
+```c
+// 样例输出
+(priority-change) begin
+(priority-change) Creating a high-priority thread 2.
+(priority-change) Thread 2 now lowering priority.
+(priority-change) Thread 2 should have just lowered its priority.
+(priority-change) Thread 2 exiting.
+(priority-change) Thread 2 should have just exited.
+(priority-change) end
+```
+
+大致过程：创建线程2 -> 优先级更高，先执行线程2 -> 降低2优先级 -> 执行线程1 -> ......
+
+总之，我们可以得出一个结论，创建线程的时候，或者修改线程优先级的时候就需要马上对线程进行重新调度，那么我们定义的`thread_yield()`正好可以满足这个要求，因此，我们只需要在修改线程优先级的时候调用`thread_yield()`函数即可。
+
+修改设置线程优先级函数`thread_set_priority()`
+
+```c
+/* Sets the current thread's priority to NEW_PRIORITY. */
+void
+thread_set_priority (int new_priority)
+{
+  thread_current ()->priority = new_priority;
+  // 设置完线程优先级后调用thread_yield()函数重新分配就绪线程队列
+  thread_yield ();
+}
+```
+
+修改线程创建函数`thread_create()`
+
+```c
+if (thread_current ()->priority < priority)
+{
+  thread_yield ();
+}
+```
+
+修改后，**`priority_preempt`**，**`priority-change`**测试点通过。
+
+接下来，我们解决线程优先级捐赠的问题。
+
+怎么解决这个问题？ 
+
+当发现高优先级的任务因为低优先级任务占用资源而阻塞时，**就将低优先级任务的优先级提升到等待它所占有的资源的最高优先级任务的优先级**。
+
+在一个线程获取一个锁的时候， **如果拥有这个锁的线程优先级比自己低就提高它的优先级，然后在这个线程释放掉这个锁之后把原来拥有这个锁的线程改回原来的优先级**。
+
+通过分析所有线程优先级调度的测试点，我们可以得出如下结论，具体分析过程过于复杂，我们会在下面稍微提几句。
+
+先总结一下所有测试整合的逻辑：
+
+1. 在一个线程获取一个锁的时候， 如果拥有这个锁的线程优先级比自己低就提高它的优先级，并且如果这个锁还被别的锁锁着， 将会递归地捐赠优先级， 然后在这个线程释放掉这个锁之后恢复未捐赠逻辑下的优先级。（分析测试点**`priority-donate-one`**，关于不同线程锁的问题）
+
+2. 如果一个线程被多个线程捐赠， 维持当前优先级为捐赠优先级中的最大值（acquire和release之时）。（分析测试点**`priority-donte-multiple`**，当一个线程被多个线程捐赠的问题）
+
+3. 在对一个线程进行优先级设置的时候， 如果这个线程处于被捐赠状态， 则对original_priority进行设置， 然后如果设置的优先级大于当前优先级， 则改变当前优先级， 否则在捐赠状态取消的时候恢复original_priority。
+
+4. 在释放锁对一个锁优先级有改变的时候应考虑其余被捐赠优先级和当前优先级。
+
+5. 将信号量的等待队列实现为优先级队列。
+
+6. 将condition的waiters队列实现为优先级队列。
+
+7. 释放锁的时候若优先级改变则可以发生抢占。
+
+> **`lock_acquire()`**函数
+
+```c
+void
+lock_acquire (struct lock *lock)
+{
+  struct thread *current_thread = thread_current ();
+  struct lock *l;
+  enum intr_level old_level;
+
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (!lock_held_by_current_thread (lock));
+
+  // 当前锁有线程持有，且thread_mlfqs是false时，执行循环捐赠锁的优先级
+  if (lock->holder != NULL && !thread_mlfqs)
+  {
+    current_thread->lock_waiting = lock;
+    l = lock;
+    // 只要当前线程（线程池中的线程）的优先级大于申请锁的线程的最高优先级，那么久需要循环捐赠锁的优先级，前提是当前锁存在
+    while (l && current_thread->priority > l->max_priority)
+    {
+      // 捐赠优先级
+      l->max_priority = current_thread->priority;
+      thread_donate_priority (l->holder);
+      l = l->holder->lock_waiting;
+    }
+  }
+
+  // P操作，中断
+  sema_down (&lock->semaphore);
+
+  // 禁用中断
+  old_level = intr_disable ();
+
+  current_thread = thread_current ();
+  // 将锁给s
+  if (!thread_mlfqs)
+  {
+    current_thread->lock_waiting = NULL;
+    lock->max_priority = current_thread->priority;
+    thread_hold_the_lock (lock);
+  }
+    
+  // 拥有该锁
+  lock->holder = current_thread;
+    
+  // 还原线程状态
+  intr_set_level (old_level);
+}
+```
+
+```c
+/* If false (default), use round-robin scheduler.
+   If true, use multi-level feedback queue scheduler.
+   Controlled by kernel command-line option "-o mlfqs". */
+
+extern bool thread_mlfqs;
+```
+
+如果为`false`（默认），则使用循环调度程序。如果为`true`，则使用多级反馈队列调度程序。由内核命令行选项“-o mlfqs”控制。也就是说，这是一个由内核控制的布尔类型的变量，我们不需要管他。
+
+这里`thread_donate_priority()`和`thread_hold_the_lock()`封装成函数，注意一下这里优先级捐赠是通过直接修改锁的最高优先级， 然后调用update的时候把现成优先级更新实现的，update下面会写， 实现如下：
+
+```c
+/* Let thread hold a lock */
+void
+thread_hold_the_lock(struct lock *lock)
+{
+  // 禁用中断，原子操作
+  enum intr_level old_level = intr_disable ();
+  // 按照优先级调度的顺序插入到就绪队列中
+  list_insert_ordered (&thread_current ()->locks, &lock->elem, lock_cmp_priority, NULL);
+
+  // 只要需要获取锁的优先级大于当前线程的优先级时就需要捐赠当前线程的优先级为锁的优先级
+  if (lock->max_priority > thread_current ()->priority)
+  {
+    // 替换线程优先级为锁的最高优先级
+    thread_current ()->priority = lock->max_priority;
+    thread_yield ();
+  }
+    
+  // 还原线程状态
+  intr_set_level (old_level);
+}
+```
+
+```c
+/* Donate current priority to thread t. */
+void
+thread_donate_priority (struct thread *t)
+{
+  // 禁用状态，原子操作
+  enum intr_level old_level = intr_disable ();
+  thread_update_priority (t);
+
+  // 当前线程处于就绪状态时
+  if (t->status == THREAD_READY)
+  {
+    list_remove (&t->elem);
+    list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
+  }
+  intr_set_level (old_level);
+}
+```
 
